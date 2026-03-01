@@ -1,5 +1,2 @@
 package com.trimly.enums;
-
-public enum Role {
-    CUSTOMER, BARBER, ADMIN
-}
+public enum Role { CUSTOMER, BARBER, ADMIN }

@@ -1,265 +1,403 @@
 package com.trimly.service;
 
-import com.trimly.dto.BookingDto;
+import com.trimly.dto.*;
 import com.trimly.entity.*;
 import com.trimly.enums.BookingStatus;
-import com.trimly.enums.NotificationType;
-import com.trimly.enums.Role;
+import com.trimly.enums.RescheduleStatus;
 import com.trimly.enums.ShopStatus;
-import com.trimly.exception.BadRequestException;
-import com.trimly.exception.ResourceNotFoundException;
-import com.trimly.exception.UnauthorizedException;
+import com.trimly.exception.TrimlyException;
 import com.trimly.repository.*;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.util.Arrays;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.stream.Collectors;
 
-@Service
-@RequiredArgsConstructor
+@Service @RequiredArgsConstructor
+@Transactional
 public class BookingService {
 
-    private final BookingRepository bookingRepository;
-    private final ShopRepository shopRepository;
-    private final ServiceRepository serviceRepository;
-    private final NotificationRepository notificationRepository;
-    private final UserRepository userRepository;
+    private final BookingRepository   bookingRepo;
+    private final ShopRepository      shopRepo;
+    private final BarberServiceRepository svcRepo;
+    private final UserRepository      userRepo;
+    private final WhatsAppService     wa;
+
+    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd MMM yyyy");
+    private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("h:mm a");
+
+    // ── Customer — Create booking ─────────────────────────────────────────
 
     @Transactional
-    public BookingDto.BookingResponse createBooking(User customer, BookingDto.CreateBookingRequest req) {
-        Shop shop = shopRepository.findById(req.getShopId())
-                .orElseThrow(() -> new ResourceNotFoundException("Shop not found"));
+    public BookingResponse create(Long customerId, BookingRequest req) {
+        User customer = userRepo.findById(customerId)
+            .orElseThrow(() -> TrimlyException.notFound("User not found"));
+        Shop shop = shopRepo.findById(req.getShopId())
+            .orElseThrow(() -> TrimlyException.notFound("Shop not found"));
 
         if (shop.getStatus() != ShopStatus.ACTIVE)
-            throw new BadRequestException("Shop is not currently active");
+            throw TrimlyException.badRequest("Shop is not currently accepting bookings");
+        if (!shop.isOpen())
+            throw TrimlyException.badRequest("Shop is currently closed");
 
-        // Validate services belong to this shop
-        List<com.trimly.entity.Service> services = serviceRepository.findAllById(req.getServiceIds());
-        if (services.size() != req.getServiceIds().size())
-            throw new BadRequestException("One or more services not found");
-        services.forEach(s -> {
-            if (!s.getShop().getId().equals(shop.getId()))
-                throw new BadRequestException("Service does not belong to this shop");
-            if (!s.getEnabled())
-                throw new BadRequestException("Service '" + s.getName() + "' is not available");
-        });
+        // Validate services
+        List<BarberService> svcs = svcRepo.findAllById(req.getServiceIds());
+        if (svcs.size() != req.getServiceIds().size())
+            throw TrimlyException.badRequest("One or more selected services not found");
+        if (svcs.stream().anyMatch(s -> !s.getShop().getId().equals(shop.getId()) || !s.isEnabled()))
+            throw TrimlyException.badRequest("Selected services are not available at this shop");
 
-        // Check slot not already taken
-        List<Booking> existingBookings = bookingRepository.findActiveByShopAndDate(shop, req.getBookingDate());
-        boolean slotTaken = existingBookings.stream().anyMatch(b -> b.getSlotId().equals(req.getSlotId()));
-        if (slotTaken) throw new BadRequestException("Slot is no longer available. Please choose another.");
+        // Seat-aware availability check
+        int seatsUsed = bookingRepo.countSeatsUsedAtSlot(shop.getId(), req.getBookingDate(), req.getSlotTime());
+        if (seatsUsed + req.getSeats() > shop.getSeats())
+            throw TrimlyException.conflict("Not enough seats at this time slot. Please pick another.");
 
-        // Calculate totals
-        int duration = services.stream().mapToInt(com.trimly.entity.Service::getDuration).sum();
-        double amount = services.stream().mapToDouble(com.trimly.entity.Service::getPrice).sum();
-        String servicesLabel = services.stream().map(com.trimly.entity.Service::getName).collect(Collectors.joining(", "));
-        String serviceIds = req.getServiceIds().stream().map(String::valueOf).collect(Collectors.joining(","));
+        // Calculate financials
+        int duration = svcs.stream().mapToInt(BarberService::getDurationMinutes).sum();
+        BigDecimal total = svcs.stream().map(BarberService::getPrice).reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal fee   = total.multiply(shop.getCommissionPercent())
+            .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP);
 
-        Booking booking = Booking.builder()
-                .shop(shop)
-                .customer(customer)
-                .customerName(req.getCustomerName())
-                .customerPhone(req.getCustomerPhone())
-                .serviceIds(serviceIds)
-                .servicesLabel(servicesLabel)
-                .slot(req.getSlot())
-                .slotId(req.getSlotId())
-                .bookingDate(req.getBookingDate())
-                .amount(amount)
-                .duration(duration)
-                .status(BookingStatus.PENDING)
-                .build();
+        String snapshot = svcs.stream().map(BarberService::getServiceName).collect(Collectors.joining(", "));
+        String ids      = req.getServiceIds().stream().map(String::valueOf).collect(Collectors.joining(","));
 
-        booking = bookingRepository.save(booking);
+        Booking b = bookingRepo.save(Booking.builder()
+            .shop(shop).customer(customer)
+            .servicesSnapshot(snapshot).serviceIds(ids)
+            .bookingDate(req.getBookingDate()).slotTime(req.getSlotTime())
+            .durationMinutes(duration).seats(req.getSeats())
+            .totalAmount(total).platformFee(fee).barberEarning(total.subtract(fee))
+            .build());
 
-        // Update shop stats
+        // Notify barber via WhatsApp
+        String barberPhone = shop.getOwner().getPhone();
+        String date = req.getBookingDate().format(DATE_FMT);
+        String time = req.getSlotTime().format(TIME_FMT);
+        String ref  = "#TRM" + b.getId();
+        wa.sendBookingRequestToBarber(barberPhone, customer.getFullName(), snapshot, date, time, ref);
+
+        return toResp(b, false);
+    }
+
+    // ── Barber — List & Stats ─────────────────────────────────────────────
+
+    public List<BookingResponse> getBarberBookings(Long ownerId, BookingStatus status) {
+        Shop shop = shopRepo.findByOwner_Id(ownerId)
+            .orElseThrow(() -> TrimlyException.notFound("Shop not found"));
+        List<Booking> list = status != null
+            ? bookingRepo.findByShop_IdAndStatusOrderByCreatedAtDesc(shop.getId(), status)
+            : bookingRepo.findByShop_IdOrderByCreatedAtDesc(shop.getId());
+        return list.stream().map(b -> toResp(b, true)).collect(Collectors.toList());
+    }
+
+    public DashboardStats getBarberStats(Long ownerId) {
+        Shop shop = shopRepo.findByOwner_Id(ownerId)
+            .orElseThrow(() -> TrimlyException.notFound("Shop not found"));
+        long total     = bookingRepo.countByShop_Id(shop.getId());
+        long pending   = bookingRepo.countByShop_IdAndStatus(shop.getId(), BookingStatus.PENDING);
+        long confirmed = bookingRepo.countByShop_IdAndStatus(shop.getId(), BookingStatus.CONFIRMED);
+        long completed = bookingRepo.countByShop_IdAndStatus(shop.getId(), BookingStatus.COMPLETED);
+        BigDecimal rev = bookingRepo.totalRevenueByShop(shop.getId());
+        BigDecimal comm = rev.multiply(shop.getCommissionPercent())
+            .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP);
+
+        return DashboardStats.builder()
+            .totalBookings(total).pendingBookings(pending)
+            .confirmedBookings(confirmed).completedBookings(completed)
+            .totalRevenue(rev).totalCommission(comm)
+            .barberEarnings(rev.subtract(comm)).build();
+    }
+
+    // ── Barber — Accept ───────────────────────────────────────────────────
+
+    @Transactional
+    public BookingResponse accept(Long ownerId, Long id) {
+        Booking b = barberBooking(ownerId, id);
+        if (b.getStatus() != BookingStatus.PENDING)
+            throw TrimlyException.badRequest("Only pending bookings can be accepted");
+        b.setStatus(BookingStatus.CONFIRMED);
+        bookingRepo.save(b);
+
+        String date = b.getBookingDate().format(DATE_FMT);
+        String time = b.getSlotTime().format(TIME_FMT);
+        wa.sendBookingConfirmedToCustomer(
+            b.getCustomer().getPhone(), b.getCustomer().getFullName(),
+            b.getShop().getShopName(), b.getServicesSnapshot(), date, time);
+
+        return toResp(b, true);
+    }
+
+    // ── Barber — Reject ───────────────────────────────────────────────────
+
+    @Transactional
+    public BookingResponse reject(Long ownerId, Long id, BookingActionRequest req) {
+        Booking b = barberBooking(ownerId, id);
+        if (b.getStatus() != BookingStatus.PENDING)
+            throw TrimlyException.badRequest("Only pending bookings can be rejected");
+        b.setStatus(BookingStatus.REJECTED);
+        b.setCancelReason(req.getCancelReason());
+        bookingRepo.save(b);
+
+        wa.sendBookingRejectedToCustomer(
+            b.getCustomer().getPhone(), b.getCustomer().getFullName(),
+            b.getShop().getShopName(), b.getServicesSnapshot(),
+            req.getCancelReason());
+
+        return toResp(b, true);
+    }
+
+    // ── Barber — Cancel confirmed booking ─────────────────────────────────
+
+    @Transactional
+    public BookingResponse cancelByBarber(Long ownerId, Long id, BookingActionRequest req) {
+        Booking b = barberBooking(ownerId, id);
+        if (b.getStatus() != BookingStatus.CONFIRMED)
+            throw TrimlyException.badRequest("Only confirmed bookings can be cancelled by the barber");
+        b.setStatus(BookingStatus.CANCELLED);
+        b.setCancelReason(req.getCancelReason());
+        bookingRepo.save(b);
+
+        String date = b.getBookingDate().format(DATE_FMT);
+        String time = b.getSlotTime().format(TIME_FMT);
+        wa.sendCancellationNotice(b.getCustomer().getPhone(),
+            b.getCustomer().getFullName(), b.getShop().getShopName(), date, time);
+
+        return toResp(b, true);
+    }
+
+    // ── Barber — Complete ─────────────────────────────────────────────────
+
+    @Transactional
+    public BookingResponse complete(Long ownerId, Long id) {
+        Booking b = barberBooking(ownerId, id);
+        if (b.getStatus() != BookingStatus.CONFIRMED)
+            throw TrimlyException.badRequest("Only confirmed bookings can be completed");
+        b.setStatus(BookingStatus.COMPLETED);
+
+        Shop shop = b.getShop();
         shop.setTotalBookings(shop.getTotalBookings() + 1);
-        shopRepository.save(shop);
+        shop.setMonthlyRevenue(shop.getMonthlyRevenue().add(b.getTotalAmount()));
+        shopRepo.save(shop);
+        bookingRepo.save(b);
 
-        // Notify the barber
-        Notification barberNotif = Notification.builder()
-                .recipient(shop.getOwner())
-                .recipientRole(Role.BARBER)
-                .type(NotificationType.NEW_BOOKING)
-                .title("New Booking Request!")
-                .body(req.getCustomerName() + " booked " + servicesLabel + " at " + req.getSlot())
-                .booking(booking)
-                .build();
-        notificationRepository.save(barberNotif);
+        wa.sendBookingCompleted(b.getCustomer().getPhone(),
+            b.getCustomer().getFullName(), shop.getShopName(),
+            "₹" + b.getTotalAmount());
 
-        return toResponse(booking);
+        return toResp(b, true);
     }
 
-    // ─── Customer ─────────────────────────────────────────────────────────────
-    public List<BookingDto.BookingResponse> getMyBookings(User customer) {
-        return bookingRepository.findByCustomerOrderByCreatedAtDesc(customer).stream()
-                .map(this::toResponse)
-                .collect(Collectors.toList());
-    }
+    // ── Barber — Request Reschedule ───────────────────────────────────────
 
     @Transactional
-    public BookingDto.BookingResponse cancelBooking(User customer, Long bookingId) {
-        Booking booking = bookingRepository.findById(bookingId)
-                .orElseThrow(() -> new ResourceNotFoundException("Booking not found"));
-        if (!booking.getCustomer().getId().equals(customer.getId()))
-            throw new UnauthorizedException("Not your booking");
-        if (booking.getStatus() == BookingStatus.COMPLETED)
-            throw new BadRequestException("Cannot cancel a completed booking");
-        if (booking.getStatus() == BookingStatus.CANCELLED)
-            throw new BadRequestException("Booking is already cancelled");
+    public BookingResponse requestReschedule(Long ownerId, Long id, RescheduleRequest req) {
+        Booking b = barberBooking(ownerId, id);
+        if (b.getStatus() != BookingStatus.CONFIRMED && b.getStatus() != BookingStatus.PENDING)
+            throw TrimlyException.badRequest("Can only reschedule pending or confirmed bookings");
 
-        booking.setStatus(BookingStatus.CANCELLED);
-        bookingRepository.save(booking);
+        // Check that the new slot isn't full either
+        int newSeatsUsed = bookingRepo.countSeatsUsedAtSlot(
+            b.getShop().getId(), req.getNewDate(), req.getNewTime());
+        // Subtract current booking's seats since they'll move
+        if (newSeatsUsed + b.getSeats() > b.getShop().getSeats())
+            throw TrimlyException.conflict("The new slot doesn't have enough seats available");
 
-        // Notify barber
-        Notification n = Notification.builder()
-                .recipient(booking.getShop().getOwner())
-                .recipientRole(Role.BARBER)
-                .type(NotificationType.BOOKING_CANCELLED)
-                .title("Booking Cancelled")
-                .body(booking.getCustomerName() + " cancelled their " + booking.getSlot() + " appointment")
-                .booking(booking)
-                .build();
-        notificationRepository.save(n);
+        String oldTime = b.getSlotTime().format(TIME_FMT);
+        b.setRescheduleDate(req.getNewDate());
+        b.setRescheduleTime(req.getNewTime());
+        b.setRescheduleReason(req.getReason());
+        b.setRescheduleStatus(RescheduleStatus.PENDING);
+        b.setStatus(BookingStatus.RESCHEDULE_REQUESTED);
+        bookingRepo.save(b);
 
-        return toResponse(booking);
+        String newDate = req.getNewDate().format(DATE_FMT);
+        String newTime = req.getNewTime().format(TIME_FMT);
+        wa.sendRescheduleRequestToCustomer(
+            b.getCustomer().getPhone(), b.getCustomer().getFullName(),
+            b.getShop().getShopName(), oldTime, newDate, newTime, req.getReason());
+
+        return toResp(b, true);
     }
+
+    // ── Customer — Respond to Reschedule ──────────────────────────────────
 
     @Transactional
-    public BookingDto.BookingResponse rateBooking(User customer, Long bookingId, BookingDto.RateBookingRequest req) {
-        Booking booking = bookingRepository.findById(bookingId)
-                .orElseThrow(() -> new ResourceNotFoundException("Booking not found"));
-        if (!booking.getCustomer().getId().equals(customer.getId()))
-            throw new UnauthorizedException("Not your booking");
-        if (booking.getStatus() != BookingStatus.COMPLETED)
-            throw new BadRequestException("Can only rate completed bookings");
-        if (booking.getRating() != null && booking.getRating() > 0)
-            throw new BadRequestException("Already rated");
+    public BookingResponse respondToReschedule(Long customerId, Long id, RescheduleResponseRequest req) {
+        Booking b = bookingRepo.findById(id)
+            .orElseThrow(() -> TrimlyException.notFound("Booking not found"));
+        if (!b.getCustomer().getId().equals(customerId))
+            throw TrimlyException.forbidden("Not your booking");
+        if (b.getStatus() != BookingStatus.RESCHEDULE_REQUESTED)
+            throw TrimlyException.badRequest("No pending reschedule request for this booking");
 
-        if (req.getRating() < 1 || req.getRating() > 5)
-            throw new BadRequestException("Rating must be between 1 and 5");
+        String barberPhone = b.getShop().getOwner().getPhone();
+        String newTime = b.getRescheduleTime().format(TIME_FMT);
 
-        booking.setRating(req.getRating());
-        booking.setRatingComment(req.getComment());
-        bookingRepository.save(booking);
+        if (req.isAccept()) {
+            b.setBookingDate(b.getRescheduleDate());
+            b.setSlotTime(b.getRescheduleTime());
+            b.setRescheduleStatus(RescheduleStatus.ACCEPTED);
+            b.setStatus(BookingStatus.CONFIRMED);
+            wa.sendRescheduleResponseToBarber(barberPhone, b.getShop().getShopName(),
+                b.getCustomer().getFullName(), newTime, "Accepted ✅");
+        } else {
+            b.setRescheduleStatus(RescheduleStatus.DECLINED);
+            b.setStatus(BookingStatus.CONFIRMED); // revert to original slot
+            wa.sendRescheduleResponseToBarber(barberPhone, b.getShop().getShopName(),
+                b.getCustomer().getFullName(), newTime, "Declined ❌");
+        }
 
-        // Update shop rating
-        Shop shop = booking.getShop();
-        updateShopRating(shop);
+        // Clear reschedule fields
+        b.setRescheduleDate(null);
+        b.setRescheduleTime(null);
+        b.setRescheduleReason(null);
+        bookingRepo.save(b);
 
-        return toResponse(booking);
+        return toResp(b, false);
     }
 
-    // ─── Barber ───────────────────────────────────────────────────────────────
-    public List<BookingDto.BookingResponse> getShopBookings(User owner) {
-        Shop shop = shopRepository.findByOwner(owner)
-                .orElseThrow(() -> new ResourceNotFoundException("Shop not found"));
-        return bookingRepository.findByShopOrderByCreatedAtDesc(shop).stream()
-                .map(this::toResponse)
-                .collect(Collectors.toList());
-    }
+    // ── Customer — Cancel ─────────────────────────────────────────────────
 
     @Transactional
-    public BookingDto.BookingResponse updateBookingStatus(User owner, Long bookingId, BookingDto.UpdateStatusRequest req) {
-        Shop shop = shopRepository.findByOwner(owner)
-                .orElseThrow(() -> new ResourceNotFoundException("Shop not found"));
-        Booking booking = bookingRepository.findById(bookingId)
-                .orElseThrow(() -> new ResourceNotFoundException("Booking not found"));
-        if (!booking.getShop().getId().equals(shop.getId()))
-            throw new UnauthorizedException("Not your booking");
+    public BookingResponse cancelByCustomer(Long customerId, Long id) {
+        Booking b = bookingRepo.findById(id)
+            .orElseThrow(() -> TrimlyException.notFound("Booking not found"));
+        if (!b.getCustomer().getId().equals(customerId))
+            throw TrimlyException.forbidden("Not your booking");
+        if (b.getStatus() != BookingStatus.PENDING && b.getStatus() != BookingStatus.CONFIRMED
+                && b.getStatus() != BookingStatus.RESCHEDULE_REQUESTED)
+            throw TrimlyException.badRequest("Cannot cancel at this stage");
 
-        BookingStatus newStatus;
-        try {
-            newStatus = BookingStatus.valueOf(req.getStatus().toUpperCase());
-        } catch (IllegalArgumentException e) {
-            throw new BadRequestException("Invalid status: " + req.getStatus());
-        }
+        b.setStatus(BookingStatus.CANCELLED);
+        bookingRepo.save(b);
 
-        booking.setStatus(newStatus);
-        bookingRepository.save(booking);
+        String date = b.getBookingDate().format(DATE_FMT);
+        String time = b.getSlotTime().format(TIME_FMT);
+        wa.sendCancellationNotice(b.getShop().getOwner().getPhone(),
+            b.getShop().getShopName(), b.getCustomer().getFullName(), date, time);
 
-        // Update monthly revenue if completed
-        if (newStatus == BookingStatus.COMPLETED) {
-            shop.setMonthlyRev(shop.getMonthlyRev() + booking.getAmount());
-            shopRepository.save(shop);
-        }
-
-        // Notify customer
-        if (booking.getCustomer() != null) {
-            NotificationType type = newStatus == BookingStatus.CONFIRMED
-                    ? NotificationType.BOOKING_CONFIRMED
-                    : newStatus == BookingStatus.REJECTED
-                    ? NotificationType.BOOKING_REJECTED
-                    : NotificationType.BOOKING_COMPLETED;
-
-            String title = newStatus == BookingStatus.CONFIRMED ? "Booking Confirmed ✓"
-                    : newStatus == BookingStatus.REJECTED ? "Booking Rejected"
-                    : "Appointment Complete";
-            String body = newStatus == BookingStatus.CONFIRMED
-                    ? "Your appointment at " + shop.getShopName() + " is confirmed for " + booking.getSlot()
-                    : newStatus == BookingStatus.REJECTED
-                    ? shop.getShopName() + " cannot accommodate your request. Please book another slot."
-                    : "Your appointment at " + shop.getShopName() + " is complete. Please rate your experience!";
-
-            Notification n = Notification.builder()
-                    .recipient(booking.getCustomer())
-                    .recipientRole(Role.CUSTOMER)
-                    .type(type)
-                    .title(title)
-                    .body(body)
-                    .booking(booking)
-                    .build();
-            notificationRepository.save(n);
-        }
-
-        return toResponse(booking);
+        return toResp(b, false);
     }
 
-    // ─── Admin ────────────────────────────────────────────────────────────────
-    public List<BookingDto.BookingResponse> getAllBookings() {
-        return bookingRepository.findAll().stream()
-                .map(this::toResponse)
-                .collect(Collectors.toList());
-    }
+    // ── Customer — Rate ───────────────────────────────────────────────────
 
-    // ─── Helpers ──────────────────────────────────────────────────────────────
-    private void updateShopRating(Shop shop) {
-        List<Booking> ratedBookings = bookingRepository.findByShopAndStatus(shop, BookingStatus.COMPLETED)
-                .stream().filter(b -> b.getRating() != null && b.getRating() > 0).collect(Collectors.toList());
-        if (!ratedBookings.isEmpty()) {
-            double avg = ratedBookings.stream().mapToInt(Booking::getRating).average().orElse(0);
-            shop.setRating(Math.round(avg * 10.0) / 10.0);
-            shop.setReviews(ratedBookings.size());
-            shopRepository.save(shop);
+    @Transactional
+    public BookingResponse rate(Long customerId, Long id, RatingRequest req) {
+        Booking b = bookingRepo.findById(id)
+            .orElseThrow(() -> TrimlyException.notFound("Booking not found"));
+        if (!b.getCustomer().getId().equals(customerId))
+            throw TrimlyException.forbidden("Not your booking");
+        if (b.getStatus() != BookingStatus.COMPLETED)
+            throw TrimlyException.badRequest("Only completed bookings can be rated");
+        if (b.getRating() != null)
+            throw TrimlyException.badRequest("You have already rated this booking");
+
+        b.setRating(req.getRating());
+        b.setReview(req.getReview());
+        bookingRepo.save(b);
+
+        // Recalculate shop average
+        Shop shop = b.getShop();
+        List<Booking> rated = bookingRepo.findByShop_IdOrderByCreatedAtDesc(shop.getId())
+            .stream().filter(bk -> bk.getRating() != null).toList();
+        if (!rated.isEmpty()) {
+            double avg = rated.stream().mapToInt(Booking::getRating).average().orElse(0);
+            shop.setAvgRating(BigDecimal.valueOf(avg).setScale(2, RoundingMode.HALF_UP));
+            shop.setTotalReviews(rated.size());
+            shopRepo.save(shop);
         }
+        return toResp(b, false);
     }
 
-    public BookingDto.BookingResponse toResponse(Booking b) {
-        List<Long> serviceIds = b.getServiceIds() != null && !b.getServiceIds().isEmpty()
-                ? Arrays.stream(b.getServiceIds().split(",")).map(Long::parseLong).collect(Collectors.toList())
-                : List.of();
+    // ── Customer — List ───────────────────────────────────────────────────
 
-        return BookingDto.BookingResponse.builder()
-                .id(b.getId())
-                .shopId(b.getShop().getId())
-                .shopName(b.getShop().getShopName())
-                .shopEmoji(b.getShop().getEmoji())
-                .customerName(b.getCustomerName())
-                .customerPhone(b.getCustomerPhone())
-                .serviceIds(serviceIds)
-                .servicesLabel(b.getServicesLabel())
-                .slot(b.getSlot())
-                .slotId(b.getSlotId())
-                .bookingDate(b.getBookingDate())
-                .amount(b.getAmount())
-                .duration(b.getDuration())
-                .status(b.getStatus().name())
-                .rating(b.getRating())
-                .ratingComment(b.getRatingComment())
-                .createdAt(b.getCreatedAt())
-                .build();
+    public List<BookingResponse> getCustomerBookings(Long customerId) {
+        return bookingRepo.findByCustomer_IdOrderByCreatedAtDesc(customerId)
+            .stream().map(b -> toResp(b, false)).collect(Collectors.toList());
+    }
+
+    // ── Admin ─────────────────────────────────────────────────────────────
+
+    public List<BookingResponse> getAllAdmin(BookingStatus status) {
+        List<Booking> list = status != null
+            ? bookingRepo.findByStatusOrderByCreatedAtDesc(status)
+            : bookingRepo.findAllByOrderByCreatedAtDesc();
+        return list.stream().map(b -> toResp(b, true)).collect(Collectors.toList());
+    }
+
+    public DashboardStats getAdminStats() {
+        return DashboardStats.builder()
+            .totalShops(shopRepo.count())
+            .activeShops(shopRepo.countByStatus(ShopStatus.ACTIVE))
+            .pendingShops(shopRepo.countByStatus(ShopStatus.PENDING))
+            .totalBookings(bookingRepo.count())
+            .pendingBookings(bookingRepo.countByStatus(BookingStatus.PENDING))
+            .totalCommission(bookingRepo.totalPlatformCommission())
+            .totalRevenue(bookingRepo.findAllByOrderByCreatedAtDesc().stream()
+                .filter(bk -> bk.getStatus() == BookingStatus.COMPLETED)
+                .map(Booking::getTotalAmount)
+                .reduce(BigDecimal.ZERO, BigDecimal::add))
+            .totalCustomers(userRepo.countByRole(com.trimly.enums.Role.CUSTOMER))
+            .build();
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+
+    private Booking barberBooking(Long ownerId, Long bookingId) {
+        Shop shop = shopRepo.findByOwner_Id(ownerId)
+            .orElseThrow(() -> TrimlyException.notFound("Shop not found"));
+        Booking b = bookingRepo.findById(bookingId)
+            .orElseThrow(() -> TrimlyException.notFound("Booking not found"));
+        if (!b.getShop().getId().equals(shop.getId()))
+            throw TrimlyException.forbidden("This booking does not belong to your shop");
+        return b;
+    }
+
+    BookingResponse toResp(Booking b, boolean showFee) {
+        return BookingResponse.builder()
+            .id(b.getId())
+            .shopId(b.getShop().getId())
+            .shopName(b.getShop().getShopName())
+            .shopEmoji(b.getShop().getEmoji())
+            .customerId(b.getCustomer().getId())
+            .customerName(b.getCustomer().getFullName())
+            .customerPhone(b.getCustomer().getPhone())
+            .servicesSnapshot(b.getServicesSnapshot())
+            .bookingDate(b.getBookingDate())
+            .slotTime(b.getSlotTime())
+            .durationMinutes(b.getDurationMinutes())
+            .seats(b.getSeats())
+            .totalAmount(b.getTotalAmount())
+            .platformFee(showFee ? b.getPlatformFee() : null)
+            .barberEarning(showFee ? b.getBarberEarning() : null)
+            .status(b.getStatus())
+            .cancelReason(b.getCancelReason())
+            .rating(b.getRating())
+            .review(b.getReview())
+            .rescheduleDate(b.getRescheduleDate())
+            .rescheduleTime(b.getRescheduleTime())
+            .rescheduleReason(b.getRescheduleReason())
+            .rescheduleStatus(b.getRescheduleStatus())
+            .createdAt(b.getCreatedAt())
+            .build();
+    }
+
+    // ── Customer profile update ────────────────────────────────────────────
+
+    @Transactional
+    public UserInfo updateCustomerProfile(Long userId, String fullName) {
+        User user = userRepo.findById(userId)
+            .orElseThrow(() -> com.trimly.exception.TrimlyException.notFound("User not found"));
+        if (fullName != null && !fullName.isBlank())
+            user.setFullName(fullName.trim());
+        userRepo.save(user);
+        return UserInfo.builder()
+            .id(user.getId()).fullName(user.getFullName())
+            .email(user.getEmail()).phone(user.getPhone()).role(user.getRole())
+            .build();
     }
 }

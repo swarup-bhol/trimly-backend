@@ -1,242 +1,300 @@
 package com.trimly.service;
 
-import com.trimly.dto.ServiceDto;
-import com.trimly.dto.ShopDto;
+import com.trimly.dto.*;
 import com.trimly.entity.*;
 import com.trimly.enums.BookingStatus;
 import com.trimly.enums.ShopStatus;
-import com.trimly.exception.BadRequestException;
-import com.trimly.exception.ResourceNotFoundException;
-import com.trimly.repository.BookingRepository;
-import com.trimly.repository.ServiceRepository;
-import com.trimly.repository.ShopRepository;
-import com.trimly.repository.UserRepository;
+import com.trimly.exception.TrimlyException;
+import com.trimly.repository.*;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDate;
+import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
+import java.util.*;
 import java.util.stream.Collectors;
 
-@Service
-@RequiredArgsConstructor
+@Service @RequiredArgsConstructor @Transactional
 public class ShopService {
 
-    private final ShopRepository shopRepository;
-    private final ServiceRepository serviceRepository;
-    private final BookingRepository bookingRepository;
-    private final UserRepository userRepository;
+    private final ShopRepository       shopRepo;
+    private final BarberServiceRepository svcRepo;
+    private final BookingRepository    bookingRepo;
+    private final BlockedSlotRepository blockedSlotRepo;   // ← NEW
 
-    // ─── Public ─────────────────────────────────────────────────────────────
-    public List<ShopDto.ShopResponse> getPublicShops() {
-        return shopRepository.findActiveShops().stream()
-                .map(this::toResponse)
-                .collect(Collectors.toList());
+    // ── Public browsing ───────────────────────────────────────────────────
+
+    @Transactional(readOnly = true)
+    public List<ShopResponse> getPublicShops(String q, String city, String area) {
+        String qn    = StringUtils.hasText(q)    ? q    : null;
+        String cityN = StringUtils.hasText(city) ? city : null;
+        String areaN = StringUtils.hasText(area) ? area : null;
+        return shopRepo.searchActive(qn, cityN, areaN).stream()
+                .map(this::toPublic).collect(Collectors.toList());
     }
 
-    public ShopDto.ShopResponse getPublicShop(Long shopId) {
-        Shop shop = shopRepository.findById(shopId)
-                .orElseThrow(() -> new ResourceNotFoundException("Shop not found"));
+    @Transactional(readOnly = true)
+    public ShopResponse getPublicShopById(Long id) {
+        Shop s = shopRepo.findById(id)
+                .orElseThrow(() -> TrimlyException.notFound("Shop not found"));
+        if (s.getStatus() != ShopStatus.ACTIVE) throw TrimlyException.notFound("Shop not available");
+        return toPublic(s);
+    }
+
+    @Transactional(readOnly = true)
+    public ShopResponse getPublicShopBySlug(String slug) {
+        Shop s = shopRepo.findBySlug(slug)
+                .orElseThrow(() -> TrimlyException.notFound("Shop not found"));
+        if (s.getStatus() != ShopStatus.ACTIVE) throw TrimlyException.notFound("Shop not available");
+        return toPublic(s);
+    }
+
+    @Transactional(readOnly = true)
+    public SlotAvailabilityResponse getSlots(Long shopId, LocalDate date) {
+        Shop shop = shopRepo.findById(shopId)
+                .orElseThrow(() -> TrimlyException.notFound("Shop not found"));
         if (shop.getStatus() != ShopStatus.ACTIVE)
-            throw new BadRequestException("Shop is not available");
-        return toResponse(shop);
+            throw TrimlyException.notFound("Shop not available");
+
+        List<SlotInfo> slots = genSlotsWithSeats(shop, date);
+        return SlotAvailabilityResponse.builder()
+                .date(date)
+                .slots(slots)
+                .totalSlots(slots.size())
+                .availableSlots((int) slots.stream().filter(SlotInfo::isAvailable).count())
+                .build();
     }
 
-    public List<ServiceDto.ServiceResponse> getShopServices(Long shopId) {
-        Shop shop = shopRepository.findById(shopId)
-                .orElseThrow(() -> new ResourceNotFoundException("Shop not found"));
-        return serviceRepository.findByShopAndEnabled(shop, true).stream()
-                .map(this::toServiceResponse)
-                .collect(Collectors.toList());
-    }
-
-    public List<ShopDto.SlotResponse> getShopSlots(Long shopId, String date) {
-        Shop shop = shopRepository.findById(shopId)
-                .orElseThrow(() -> new ResourceNotFoundException("Shop not found"));
-
-        // Get taken slot IDs from active bookings for the date
-        List<Booking> activeBookings = bookingRepository.findActiveByShopAndDate(shop, date);
-        List<String> takenSlots = activeBookings.stream()
-                .map(Booking::getSlotId)
-                .collect(Collectors.toList());
-
-        List<String> disabledSlots = shop.getDisabledSlots() != null && !shop.getDisabledSlots().isEmpty()
-                ? Arrays.asList(shop.getDisabledSlots().split(","))
-                : new ArrayList<>();
-
-        return generateSlots(shop, takenSlots, disabledSlots);
-    }
-
-    private List<ShopDto.SlotResponse> generateSlots(Shop shop, List<String> taken, List<String> disabled) {
-        List<ShopDto.SlotResponse> slots = new ArrayList<>();
-        String[] openParts = shop.getOpenTime().split(":");
-        String[] closeParts = shop.getCloseTime().split(":");
-        int openMins = Integer.parseInt(openParts[0]) * 60 + Integer.parseInt(openParts[1]);
-        int closeMins = Integer.parseInt(closeParts[0]) * 60 + Integer.parseInt(closeParts[1]);
-        int slotMin = shop.getSlotMin();
-
-        for (int m = openMins; m < closeMins; m += slotMin) {
-            int h = m / 60, min = m % 60;
-            String id = h + String.format("%02d", min);
-            int displayH = h > 12 ? h - 12 : (h == 0 ? 12 : h);
-            String ampm = h >= 12 ? "PM" : "AM";
-            String label = displayH + ":" + String.format("%02d", min) + " " + ampm;
-
-            slots.add(ShopDto.SlotResponse.builder()
-                    .id(id)
-                    .label(label)
-                    .taken(taken.contains(id))
-                    .disabled(disabled.contains(id))
-                    .build());
+    @Transactional(readOnly = true)
+    public LocationMeta getLocationMeta() {
+        List<String> cities = shopRepo.findActiveCities();
+        Map<String, List<String>> areasByCity = new LinkedHashMap<>();
+        for (String city : cities) {
+            areasByCity.put(city, shopRepo.findActiveAreasInCity(city));
         }
-        return slots;
+        return LocationMeta.builder().cities(cities).areasByCity(areasByCity).build();
     }
 
-    // ─── Barber ──────────────────────────────────────────────────────────────
-    public ShopDto.ShopResponse getMyShop(User owner) {
-        Shop shop = shopRepository.findByOwner(owner)
-                .orElseThrow(() -> new ResourceNotFoundException("Shop not found"));
-        return toResponse(shop);
+    // ── Barber ────────────────────────────────────────────────────────────
+
+    @Transactional(readOnly = true)
+    public ShopResponse getBarberShop(Long ownerId) {
+        return toBarber(shopRepo.findByOwner_Id(ownerId)
+                .orElseThrow(() -> TrimlyException.notFound("Shop not found")));
     }
 
-    @Transactional
-    public ShopDto.ShopResponse updateMyShop(User owner, ShopDto.UpdateShopRequest req) {
-        Shop shop = shopRepository.findByOwner(owner)
-                .orElseThrow(() -> new ResourceNotFoundException("Shop not found"));
+    public ShopResponse updateShop(Long ownerId, ShopUpdateRequest req) {
+        Shop s = shopRepo.findByOwner_Id(ownerId)
+                .orElseThrow(() -> TrimlyException.notFound("Shop not found"));
 
-        if (req.getShopName() != null) shop.setShopName(req.getShopName());
-        if (req.getLocation() != null) shop.setLocation(req.getLocation());
-        if (req.getPhone() != null) shop.setPhone(req.getPhone());
-        if (req.getBio() != null) shop.setBio(req.getBio());
-        if (req.getEmoji() != null) shop.setEmoji(req.getEmoji());
-        if (req.getColor1() != null) shop.setColor1(req.getColor1());
-        if (req.getColor2() != null) shop.setColor2(req.getColor2());
-        if (req.getIsOpen() != null) shop.setIsOpen(req.getIsOpen());
-        if (req.getSeats() != null) shop.setSeats(req.getSeats());
-        if (req.getOpenTime() != null) shop.setOpenTime(req.getOpenTime());
-        if (req.getCloseTime() != null) shop.setCloseTime(req.getCloseTime());
-        if (req.getSlotMin() != null) shop.setSlotMin(req.getSlotMin());
-        if (req.getWorkDays() != null) shop.setWorkDays(req.getWorkDays());
-        if (req.getDisabledSlots() != null) shop.setDisabledSlots(req.getDisabledSlots());
+        if (StringUtils.hasText(req.getShopName()))       s.setShopName(req.getShopName().trim());
+        if (StringUtils.hasText(req.getLocation()))       s.setLocation(req.getLocation().trim());
+        if (StringUtils.hasText(req.getCity()))           s.setCity(req.getCity().trim());
+        if (StringUtils.hasText(req.getArea()))           s.setArea(req.getArea().trim());
+        if (req.getLatitude() != null)                    s.setLatitude(req.getLatitude());
+        if (req.getLongitude() != null)                   s.setLongitude(req.getLongitude());
+        if (StringUtils.hasText(req.getBio()))            s.setBio(req.getBio().trim());
+        if (StringUtils.hasText(req.getEmoji()))          s.setEmoji(req.getEmoji().trim());
+        if (StringUtils.hasText(req.getPhone()))          s.setPhone(req.getPhone().trim());
+        if (req.getIsOpen() != null)                      s.setOpen(req.getIsOpen());
+        if (req.getSeats() != null)                       s.setSeats(req.getSeats());
+        if (StringUtils.hasText(req.getWorkDays()))       s.setWorkDays(req.getWorkDays());
+        if (req.getOpenTime() != null)                    s.setOpenTime(req.getOpenTime());
+        if (req.getCloseTime() != null)                   s.setCloseTime(req.getCloseTime());
+        if (req.getSlotDurationMinutes() != null)         s.setSlotDurationMinutes(req.getSlotDurationMinutes());
 
-        return toResponse(shopRepository.save(shop));
+        return toBarber(shopRepo.save(s));
     }
 
-    // ─── Services CRUD (Barber) ──────────────────────────────────────────────
-    @Transactional
-    public ServiceDto.ServiceResponse addService(User owner, ServiceDto.CreateServiceRequest req) {
-        Shop shop = shopRepository.findByOwner(owner)
-                .orElseThrow(() -> new ResourceNotFoundException("Shop not found"));
-        com.trimly.entity.Service service = com.trimly.entity.Service.builder()
+    public ServiceResponse addService(Long ownerId, ServiceRequest req) {
+        Shop shop = shopRepo.findByOwner_Id(ownerId)
+                .orElseThrow(() -> TrimlyException.notFound("Shop not found"));
+        BarberService svc = svcRepo.save(BarberService.builder()
                 .shop(shop)
-                .name(req.getName())
+                .serviceName(req.getServiceName().trim())
                 .description(req.getDescription())
                 .category(req.getCategory())
-                .icon(req.getIcon())
-                .duration(req.getDuration())
                 .price(req.getPrice())
-                .enabled(req.getEnabled() != null ? req.getEnabled() : true)
-                .build();
-        return toServiceResponse(serviceRepository.save(service));
+                .durationMinutes(req.getDurationMinutes())
+                .icon(req.getIcon() != null ? req.getIcon() : "✂️")
+                .isCombo(req.isCombo())
+                .build());
+        return toSvcResp(svc, shop.getCommissionPercent(), true);
     }
 
-    @Transactional
-    public ServiceDto.ServiceResponse updateService(User owner, Long serviceId, ServiceDto.UpdateServiceRequest req) {
-        Shop shop = shopRepository.findByOwner(owner)
-                .orElseThrow(() -> new ResourceNotFoundException("Shop not found"));
-        com.trimly.entity.Service service = serviceRepository.findById(serviceId)
-                .orElseThrow(() -> new ResourceNotFoundException("Service not found"));
-        if (!service.getShop().getId().equals(shop.getId()))
-            throw new BadRequestException("Service does not belong to your shop");
+    public ServiceResponse updateService(Long ownerId, Long svcId, ServiceRequest req) {
+        Shop shop = shopRepo.findByOwner_Id(ownerId)
+                .orElseThrow(() -> TrimlyException.notFound("Shop not found"));
+        BarberService svc = svcRepo.findById(svcId)
+                .orElseThrow(() -> TrimlyException.notFound("Service not found"));
+        if (!svc.getShop().getId().equals(shop.getId()))
+            throw TrimlyException.forbidden("Not your service");
 
-        if (req.getName() != null) service.setName(req.getName());
-        if (req.getDescription() != null) service.setDescription(req.getDescription());
-        if (req.getCategory() != null) service.setCategory(req.getCategory());
-        if (req.getIcon() != null) service.setIcon(req.getIcon());
-        if (req.getDuration() != null) service.setDuration(req.getDuration());
-        if (req.getPrice() != null) service.setPrice(req.getPrice());
-        if (req.getEnabled() != null) service.setEnabled(req.getEnabled());
+        if (StringUtils.hasText(req.getServiceName())) svc.setServiceName(req.getServiceName().trim());
+        if (req.getDescription() != null)              svc.setDescription(req.getDescription());
+        if (req.getCategory() != null)                 svc.setCategory(req.getCategory());
+        if (req.getPrice() != null)                    svc.setPrice(req.getPrice());
+        if (req.getDurationMinutes() > 0)              svc.setDurationMinutes(req.getDurationMinutes());
+        if (StringUtils.hasText(req.getIcon()))        svc.setIcon(req.getIcon());
 
-        return toServiceResponse(serviceRepository.save(service));
+        return toSvcResp(svcRepo.save(svc), shop.getCommissionPercent(), true);
     }
 
-    @Transactional
-    public void deleteService(User owner, Long serviceId) {
-        Shop shop = shopRepository.findByOwner(owner)
-                .orElseThrow(() -> new ResourceNotFoundException("Shop not found"));
-        com.trimly.entity.Service service = serviceRepository.findById(serviceId)
-                .orElseThrow(() -> new ResourceNotFoundException("Service not found"));
-        if (!service.getShop().getId().equals(shop.getId()))
-            throw new BadRequestException("Service does not belong to your shop");
-        serviceRepository.delete(service);
+    public ServiceResponse toggleService(Long ownerId, Long svcId) {
+        Shop shop = shopRepo.findByOwner_Id(ownerId)
+                .orElseThrow(() -> TrimlyException.notFound("Shop not found"));
+        BarberService svc = svcRepo.findById(svcId)
+                .orElseThrow(() -> TrimlyException.notFound("Service not found"));
+        if (!svc.getShop().getId().equals(shop.getId()))
+            throw TrimlyException.forbidden("Not your service");
+        svc.setEnabled(!svc.isEnabled());
+        return toSvcResp(svcRepo.save(svc), shop.getCommissionPercent(), true);
     }
 
-    // ─── Admin ────────────────────────────────────────────────────────────────
-    public List<ShopDto.ShopResponse> getAllShops() {
-        return shopRepository.findAll().stream()
-                .map(this::toResponse)
+    public void deleteService(Long ownerId, Long svcId) {
+        Shop shop = shopRepo.findByOwner_Id(ownerId)
+                .orElseThrow(() -> TrimlyException.notFound("Shop not found"));
+        BarberService svc = svcRepo.findById(svcId)
+                .orElseThrow(() -> TrimlyException.notFound("Service not found"));
+        if (!svc.getShop().getId().equals(shop.getId()))
+            throw TrimlyException.forbidden("Not your service");
+        svcRepo.delete(svc);
+    }
+
+    // ── Blocked slots ─────────────────────────────────────────────────────
+
+    @Transactional(readOnly = true)
+    public List<String> getBlockedSlots(Long userId, LocalDate date) {
+        Shop shop = shopRepo.findByOwner_Id(userId)
+                .orElseThrow(() -> TrimlyException.notFound("Shop not found"));
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("h:mm a");
+        return blockedSlotRepo.findBlockedTimes(shop.getId(), date)
+                .stream()
+                .map(t -> t.format(fmt))
                 .collect(Collectors.toList());
     }
 
-    @Transactional
-    public ShopDto.ShopResponse updateShopStatus(Long shopId, ShopStatus status) {
-        Shop shop = shopRepository.findById(shopId)
-                .orElseThrow(() -> new ResourceNotFoundException("Shop not found"));
-        shop.setStatus(status);
-        if (status == ShopStatus.ACTIVE) shop.setIsOpen(true);
-        if (status == ShopStatus.DISABLED) shop.setIsOpen(false);
-        return toResponse(shopRepository.save(shop));
+    public void blockSlot(Long userId, BlockedSlotRequest req) {
+        Shop shop = shopRepo.findByOwner_Id(userId)
+                .orElseThrow(() -> TrimlyException.notFound("Shop not found"));
+        if (blockedSlotRepo.isBlocked(shop.getId(), req.getDate(), req.getSlotTime())) return;
+        blockedSlotRepo.save(BlockedSlot.builder()
+                .shop(shop)
+                .slotDate(req.getDate())
+                .slotTime(req.getSlotTime())
+                .build());
     }
 
-    // ─── Mappers ──────────────────────────────────────────────────────────────
-    public ShopDto.ShopResponse toResponse(Shop shop) {
-        List<ServiceDto.ServiceResponse> services = serviceRepository.findByShop(shop).stream()
-                .map(this::toServiceResponse)
+    public void unblockSlot(Long userId, BlockedSlotRequest req) {
+        Shop shop = shopRepo.findByOwner_Id(userId)
+                .orElseThrow(() -> TrimlyException.notFound("Shop not found"));
+        blockedSlotRepo.deleteByShopAndDateAndTime(shop.getId(), req.getDate(), req.getSlotTime());
+    }
+
+    // ── Admin ─────────────────────────────────────────────────────────────
+
+    @Transactional(readOnly = true)
+    public List<ShopResponse> getAllAdmin() {
+        return shopRepo.findAllByOrderByCreatedAtDesc().stream()
+                .map(this::toBarber).collect(Collectors.toList());
+    }
+
+    public ShopResponse setStatus(Long shopId, ShopStatus status) {
+        Shop s = shopRepo.findById(shopId)
+                .orElseThrow(() -> TrimlyException.notFound("Shop not found"));
+        s.setStatus(status);
+        if (status == ShopStatus.DISABLED) s.setOpen(false);
+        return toBarber(shopRepo.save(s));
+    }
+
+    public ShopResponse updateCommission(Long shopId, BigDecimal pct) {
+        if (pct.compareTo(BigDecimal.ZERO) < 0 || pct.compareTo(new BigDecimal("50")) > 0)
+            throw TrimlyException.badRequest("Commission must be 0–50%");
+        Shop s = shopRepo.findById(shopId)
+                .orElseThrow(() -> TrimlyException.notFound("Shop not found"));
+        s.setCommissionPercent(pct);
+        return toBarber(shopRepo.save(s));
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+
+    private List<SlotInfo> genSlotsWithSeats(Shop shop, LocalDate date) {
+        List<SlotInfo> list = new ArrayList<>();
+        LocalTime t = shop.getOpenTime();
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("h:mm a");
+        int seats = shop.getSeats();
+
+        while (t.isBefore(shop.getCloseTime())) {
+            int used = bookingRepo.countSeatsUsedAtSlot(shop.getId(), date, t);
+            int left = Math.max(0, seats - used);
+            // ← blocked slots: treat as fully taken
+            boolean blocked = blockedSlotRepo.isBlocked(shop.getId(), date, t);
+            boolean taken = left == 0 || blocked;
+
+            list.add(SlotInfo.builder()
+                    .time(t)
+                    .label(t.format(fmt))
+                    .taken(taken)
+                    .available(!taken)
+                    .seatsTotal(seats)
+                    .seatsUsed(used)
+                    .seatsLeft(blocked ? 0 : left)
+                    .build());
+
+            t = t.plusMinutes(shop.getSlotDurationMinutes());
+        }
+        return list;
+    }
+
+    ServiceResponse toSvcResp(BarberService s, BigDecimal commPct, boolean showFee) {
+        BigDecimal fee = null, earn = null;
+        if (showFee && s.getPrice() != null) {
+            fee  = s.getPrice().multiply(commPct).divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP);
+            earn = s.getPrice().subtract(fee);
+        }
+        return ServiceResponse.builder()
+                .id(s.getId()).serviceName(s.getServiceName()).description(s.getDescription())
+                .category(s.getCategory()).price(s.getPrice()).durationMinutes(s.getDurationMinutes())
+                .icon(s.getIcon()).enabled(s.isEnabled()).isCombo(s.isCombo())
+                .platformFee(fee).barberEarning(earn).build();
+    }
+
+    public ShopResponse toPublic(Shop s) {
+        List<ServiceResponse> svcs = s.getServices().stream()
+                .filter(BarberService::isEnabled)
+                .map(sv -> toSvcResp(sv, s.getCommissionPercent(), false))
                 .collect(Collectors.toList());
-
-        return ShopDto.ShopResponse.builder()
-                .id(shop.getId())
-                .ownerName(shop.getOwner().getName())
-                .shopName(shop.getShopName())
-                .location(shop.getLocation())
-                .phone(shop.getPhone())
-                .bio(shop.getBio())
-                .emoji(shop.getEmoji())
-                .color1(shop.getColor1())
-                .color2(shop.getColor2())
-                .status(shop.getStatus().name())
-                .isOpen(shop.getIsOpen())
-                .seats(shop.getSeats())
-                .openTime(shop.getOpenTime())
-                .closeTime(shop.getCloseTime())
-                .slotMin(shop.getSlotMin())
-                .workDays(shop.getWorkDays())
-                .rating(shop.getRating())
-                .reviews(shop.getReviews())
-                .totalBookings(shop.getTotalBookings())
-                .commissionPct(shop.getCommissionPct())
-                .subscriptionFee(shop.getSubscriptionFee())
-                .plan(shop.getPlan())
-                .monthlyRev(shop.getMonthlyRev())
-                .services(services)
-                .createdAt(shop.getCreatedAt())
-                .build();
+        return buildResp(s, svcs, false);
     }
 
-    public ServiceDto.ServiceResponse toServiceResponse(com.trimly.entity.Service s) {
-        return ServiceDto.ServiceResponse.builder()
-                .id(s.getId())
-                .name(s.getName())
-                .description(s.getDescription())
-                .category(s.getCategory())
-                .icon(s.getIcon())
-                .duration(s.getDuration())
-                .price(s.getPrice())
-                .enabled(s.getEnabled())
-                .build();
+    public ShopResponse toBarber(Shop s) {
+        List<ServiceResponse> svcs = s.getServices().stream()
+                .map(sv -> toSvcResp(sv, s.getCommissionPercent(), true))
+                .collect(Collectors.toList());
+        return buildResp(s, svcs, true);
+    }
+
+    private ShopResponse buildResp(Shop s, List<ServiceResponse> svcs, boolean showFee) {
+        return ShopResponse.builder()
+                .id(s.getId()).shopName(s.getShopName()).slug(s.getSlug())
+                .location(s.getLocation()).city(s.getCity()).area(s.getArea())
+                .latitude(s.getLatitude()).longitude(s.getLongitude())
+                .bio(s.getBio()).emoji(s.getEmoji()).phone(s.getPhone())
+                .status(s.getStatus()).plan(s.getPlan()).isOpen(s.isOpen()).seats(s.getSeats())
+                .avgRating(s.getAvgRating()).totalReviews(s.getTotalReviews())
+                .totalBookings(s.getTotalBookings()).monthlyRevenue(s.getMonthlyRevenue())
+                .workDays(s.getWorkDays()).openTime(s.getOpenTime()).closeTime(s.getCloseTime())
+                .slotDurationMinutes(s.getSlotDurationMinutes())
+                .subscriptionFee(showFee ? s.getSubscriptionFee() : null)
+                .commissionPercent(showFee ? s.getCommissionPercent() : null)
+                .ownerId(s.getOwner() != null ? s.getOwner().getId() : null)
+                .ownerName(s.getOwner() != null ? s.getOwner().getFullName() : null)
+                .ownerEmail(s.getOwner() != null ? s.getOwner().getEmail() : null)
+                .createdAt(s.getCreatedAt()).services(svcs).build();
     }
 }

@@ -1,23 +1,66 @@
 package com.trimly.controller;
 
-import com.trimly.dto.AdminStatsDto;
-import com.trimly.dto.ApiResponse;
-import com.trimly.service.AdminService;
+import com.trimly.dto.*;
+import com.trimly.enums.BookingStatus;
+import com.trimly.enums.ShopStatus;
+import com.trimly.service.BookingService;
+import com.trimly.service.ShopService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
-import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
+
+import java.math.BigDecimal;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api/admin")
 @RequiredArgsConstructor
-@PreAuthorize("hasRole('ADMIN')")
 public class AdminController {
 
-    private final AdminService adminService;
+    private final ShopService    shopService;
+    private final BookingService bookingService;
 
     @GetMapping("/stats")
-    public ResponseEntity<ApiResponse<AdminStatsDto>> getStats() {
-        return ResponseEntity.ok(ApiResponse.ok(adminService.getStats()));
+    public ResponseEntity<ApiResponse<DashboardStats>> stats() {
+        return ResponseEntity.ok(ApiResponse.ok(bookingService.getAdminStats()));
+    }
+
+    @GetMapping("/shops")
+    public ResponseEntity<ApiResponse<?>> shops() {
+        return ResponseEntity.ok(ApiResponse.ok(shopService.getAllAdmin()));
+    }
+
+    /** Approve a pending shop — sets status ACTIVE, notifies barber */
+    @PostMapping("/shops/{id}/approve")
+    public ResponseEntity<ApiResponse<ShopResponse>> approve(@PathVariable Long id) {
+        return ResponseEntity.ok(ApiResponse.ok("Shop approved",
+            shopService.setStatus(id, ShopStatus.ACTIVE)));
+    }
+
+    @PostMapping("/shops/{id}/disable")
+    public ResponseEntity<ApiResponse<ShopResponse>> disable(@PathVariable Long id) {
+        return ResponseEntity.ok(ApiResponse.ok("Shop disabled",
+            shopService.setStatus(id, ShopStatus.DISABLED)));
+    }
+
+    @PostMapping("/shops/{id}/enable")
+    public ResponseEntity<ApiResponse<ShopResponse>> enable(@PathVariable Long id) {
+        return ResponseEntity.ok(ApiResponse.ok("Shop re-enabled",
+            shopService.setStatus(id, ShopStatus.ACTIVE)));
+    }
+
+    /** Update commission percentage for a specific shop (0–50%) */
+    @PatchMapping("/shops/{id}/commission")
+    public ResponseEntity<ApiResponse<ShopResponse>> commission(
+            @PathVariable Long id,
+            @RequestBody Map<String, BigDecimal> body) {
+        return ResponseEntity.ok(ApiResponse.ok("Commission updated",
+            shopService.updateCommission(id, body.get("percent"))));
+    }
+
+    @GetMapping("/bookings")
+    public ResponseEntity<ApiResponse<?>> bookings(
+            @RequestParam(required = false) BookingStatus status) {
+        return ResponseEntity.ok(ApiResponse.ok(bookingService.getAllAdmin(status)));
     }
 }

@@ -1,113 +1,135 @@
 package com.trimly.entity;
 
+import com.trimly.enums.PlanType;
 import com.trimly.enums.ShopStatus;
 import jakarta.persistence.*;
 import lombok.*;
-import org.hibernate.annotations.CreationTimestamp;
 
-import java.time.LocalDateTime;
+import java.math.BigDecimal;
+import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.List;
 
 @Entity
-@Table(name = "shops")
-@Data
-@NoArgsConstructor
-@AllArgsConstructor
-@Builder
-public class Shop {
+@Table(name = "shops", indexes = {
+    @Index(name = "idx_shop_status", columnList = "status"),
+    @Index(name = "idx_shop_slug",   columnList = "slug",   unique = true),
+    @Index(name = "idx_shop_city",   columnList = "city"),
+    @Index(name = "idx_shop_area",   columnList = "area")
+})
+@Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
+public class Shop extends BaseEntity {
 
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;
-
-    @OneToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "owner_id", nullable = false)
-    private User owner;
-
-    @Column(name = "shop_name", nullable = false)
+    @Column(nullable = false, length = 150)
     private String shopName;
 
-    @Column(nullable = false)
+    @Column(nullable = false, unique = true, length = 200)
+    private String slug;
+
+    /** Full human-readable location string e.g. "Koramangala, Bangalore" */
+    @Column(length = 200)
     private String location;
 
-    private String phone;
+    /** City e.g. "Bangalore" — used for city-level filtering */
+    @Column(length = 100)
+    private String city;
+
+    /** Neighbourhood / area e.g. "Koramangala" — used for area-level filtering */
+    @Column(length = 100)
+    private String area;
+
+    /** GPS latitude — for distance-based nearby sorting */
+    @Column(precision = 10, scale = 7)
+    private BigDecimal latitude;
+
+    /** GPS longitude */
+    @Column(precision = 10, scale = 7)
+    private BigDecimal longitude;
+
+    @Column(length = 1000)
     private String bio;
-    private String emoji;
 
-    @Column(name = "color1")
+    @Column(length = 10)
     @Builder.Default
-    private String color1 = "#1a1200";
+    private String emoji = "✂️";
 
-    @Column(name = "color2")
-    @Builder.Default
-    private String color2 = "#0d0d1a";
+    @Column(length = 20)
+    private String phone;
+
+    @Column(length = 10)
+    private String color1;
+
+    @Column(length = 10)
+    private String color2;
 
     @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 20)
     @Builder.Default
     private ShopStatus status = ShopStatus.PENDING;
 
-    @Column(name = "is_open")
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 20)
     @Builder.Default
-    private Boolean isOpen = false;
+    private PlanType plan = PlanType.STARTER;
 
+    @Column(nullable = false)
     @Builder.Default
-    private Integer seats = 2;
+    private boolean isOpen = false;
 
-    @Column(name = "open_time")
+    @Column(nullable = false)
     @Builder.Default
-    private String openTime = "09:00";
+    private int seats = 2;
 
-    @Column(name = "close_time")
+    @Column(nullable = false, precision = 5, scale = 2)
     @Builder.Default
-    private String closeTime = "19:00";
+    private BigDecimal commissionPercent = BigDecimal.TEN;
 
-    @Column(name = "slot_min")
+    @Column(nullable = false, precision = 10, scale = 2)
     @Builder.Default
-    private Integer slotMin = 30;
+    private BigDecimal subscriptionFee = new BigDecimal("499");
 
-    @Column(name = "work_days")
+    /** Comma-separated e.g. "Mon,Tue,Wed,Thu,Fri,Sat" */
+    @Column(length = 100)
     @Builder.Default
     private String workDays = "Mon,Tue,Wed,Thu,Fri,Sat";
 
-    private Double rating;
-
+    @Column
     @Builder.Default
-    private Integer reviews = 0;
+    private LocalTime openTime = LocalTime.of(9, 0);
 
-    @Column(name = "total_bookings")
+    @Column
     @Builder.Default
-    private Integer totalBookings = 0;
+    private LocalTime closeTime = LocalTime.of(20, 0);
 
-    @Column(name = "commission_pct")
+    @Column(nullable = false)
     @Builder.Default
-    private Integer commissionPct = 10;
+    private int slotDurationMinutes = 30;
 
-    @Column(name = "subscription_fee")
+    @Column(nullable = false, precision = 3, scale = 2)
     @Builder.Default
-    private Integer subscriptionFee = 499;
+    private BigDecimal avgRating = BigDecimal.ZERO;
 
-    @Column(name = "plan")
+    @Column(nullable = false)
     @Builder.Default
-    private String plan = "starter";
+    private int totalReviews = 0;
 
-    @Column(name = "monthly_rev")
+    @Column(nullable = false)
     @Builder.Default
-    private Double monthlyRev = 0.0;
+    private int totalBookings = 0;
 
-    @Column(name = "disabled_slots")
+    @Column(nullable = false, precision = 12, scale = 2)
     @Builder.Default
-    private String disabledSlots = "";
+    private BigDecimal monthlyRevenue = BigDecimal.ZERO;
+
+    @OneToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "owner_id", nullable = false, unique = true)
+    private User owner;
+
+    @OneToMany(mappedBy = "shop", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.EAGER)
+    @Builder.Default
+    private List<BarberService> services = new ArrayList<>();
 
     @OneToMany(mappedBy = "shop", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
     @Builder.Default
-    private List<Service> services = new ArrayList<>();
-
-    @OneToMany(mappedBy = "shop", cascade = CascadeType.ALL, fetch = FetchType.LAZY)
-    @Builder.Default
     private List<Booking> bookings = new ArrayList<>();
-
-    @CreationTimestamp
-    @Column(name = "created_at", updatable = false)
-    private LocalDateTime createdAt;
 }

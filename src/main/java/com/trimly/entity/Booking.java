@@ -1,79 +1,92 @@
 package com.trimly.entity;
 
 import com.trimly.enums.BookingStatus;
+import com.trimly.enums.RescheduleStatus;
 import jakarta.persistence.*;
 import lombok.*;
-import org.hibernate.annotations.CreationTimestamp;
-
-import java.time.LocalDateTime;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalTime;
 
 @Entity
-@Table(name = "bookings")
-@Data
-@NoArgsConstructor
-@AllArgsConstructor
-@Builder
-public class Booking {
+@Table(name = "bookings", indexes = {
+    @Index(name = "idx_bk_shop",     columnList = "shop_id"),
+    @Index(name = "idx_bk_customer", columnList = "customer_id"),
+    @Index(name = "idx_bk_status",   columnList = "status"),
+    @Index(name = "idx_bk_date",     columnList = "booking_date"),
+    @Index(name = "idx_bk_slot",     columnList = "shop_id,booking_date,slot_time")
+})
+@Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
+public class Booking extends BaseEntity {
 
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;
-
-    @ManyToOne(fetch = FetchType.LAZY)
+    @ManyToOne(fetch = FetchType.EAGER)
     @JoinColumn(name = "shop_id", nullable = false)
     private Shop shop;
 
-    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "customer_id")
+    @ManyToOne(fetch = FetchType.EAGER)
+    @JoinColumn(name = "customer_id", nullable = false)
     private User customer;
 
-    @Column(name = "customer_name", nullable = false)
-    private String customerName;
+    /** Snapshot of service names at time of booking (denormalised for history) */
+    @Column(nullable = false, length = 500)
+    private String servicesSnapshot;
 
-    @Column(name = "customer_phone")
-    private String customerPhone;
-
-    // Comma-separated service IDs
-    @Column(name = "service_ids")
+    /** Comma-separated service IDs */
+    @Column(length = 500)
     private String serviceIds;
 
-    // Human-readable service names
-    @Column(name = "services_label")
-    private String servicesLabel;
+    @Column(nullable = false)
+    private LocalDate bookingDate;
+
+    @Column(name = "slot_time", nullable = false)
+    private LocalTime slotTime;
 
     @Column(nullable = false)
-    private String slot;
-
-    @Column(name = "slot_id")
-    private String slotId;
-
-    @Column(name = "booking_date")
-    private String bookingDate;
+    private int durationMinutes;
 
     @Column(nullable = false)
-    private Double amount;
+    @Builder.Default
+    private int seats = 1;
 
-    @Column(nullable = false)
-    private Integer duration;
+    @Column(nullable = false, precision = 10, scale = 2)
+    private BigDecimal totalAmount;
+
+    @Column(nullable = false, precision = 10, scale = 2)
+    private BigDecimal platformFee;
+
+    @Column(nullable = false, precision = 10, scale = 2)
+    private BigDecimal barberEarning;
 
     @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 25)
     @Builder.Default
     private BookingStatus status = BookingStatus.PENDING;
 
+    @Column(length = 500)
+    private String cancelReason;
+
+    @Column
     private Integer rating;
 
-    @Column(name = "rating_comment")
-    private String ratingComment;
+    @Column(length = 1000)
+    private String review;
 
-    @CreationTimestamp
-    @Column(name = "created_at", updatable = false)
-    private LocalDateTime createdAt;
+    // ── Reschedule fields ─────────────────────────────────────────────────
+    /** The new slot proposed by the barber */
+    @Column
+    private LocalDate rescheduleDate;
 
-    @Column(name = "updated_at")
-    private LocalDateTime updatedAt;
+    @Column
+    private LocalTime rescheduleTime;
 
-    @PreUpdate
-    public void preUpdate() {
-        this.updatedAt = LocalDateTime.now();
-    }
+    @Column(length = 500)
+    private String rescheduleReason;
+
+    @Enumerated(EnumType.STRING)
+    @Column(length = 20)
+    private RescheduleStatus rescheduleStatus;
+
+    /** WhatsApp message SID returned by the API for tracking */
+    @Column(length = 100)
+    private String waMsgId;
 }
