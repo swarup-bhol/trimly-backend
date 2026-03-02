@@ -90,11 +90,20 @@ public class SecurityConfig {
     @Bean
     public CorsConfigurationSource corsSource() {
         CorsConfiguration config = new CorsConfiguration();
-        // Allow all origins with patterns
-        config.setAllowedOriginPatterns(List.of("*")); // allow all origins safely
-        config.setAllowedMethods(List.of("*"));
+
+        // ❌ WRONG — * does NOT match capacitor:// scheme in Spring
+        // config.setAllowedOriginPatterns(List.of("*"));
+
+        // ✅ CORRECT — explicitly list Capacitor origins
+        config.setAllowedOrigins(List.of(
+                "capacitor://localhost",        // Android Capacitor
+                "http://localhost",             // Android WebView fallback
+                "https://trimly.up.railway.app" // Your web frontend
+        ));
+
+        config.setAllowedMethods(List.of("GET","POST","PUT","PATCH","DELETE","OPTIONS"));
         config.setAllowedHeaders(List.of("*"));
-        config.setAllowCredentials(false); // VERY IMPORTANT
+        config.setAllowCredentials(false);
         config.setMaxAge(3600L);
 
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
