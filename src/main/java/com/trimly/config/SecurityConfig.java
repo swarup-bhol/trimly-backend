@@ -96,9 +96,11 @@ public class SecurityConfig {
 
         // ✅ CORRECT — explicitly list Capacitor origins
         config.setAllowedOrigins(List.of(
-                "capacitor://localhost",        // Android Capacitor
-                "http://localhost",             // Android WebView fallback
-                "https://trimly.up.railway.app" // Your web frontend
+                "https://localhost",               // ✅ Capacitor Android (your config)
+                "ionic://localhost",               // ✅ Capacitor iOS
+                "http://localhost:4300",           // ✅ Local dev testing
+                "http://localhost:4200",           // ✅ Angular dev
+                "https://trimly.up.railway.app"    // ✅ Your web frontend
         ));
 
         config.setAllowedMethods(List.of("GET","POST","PUT","PATCH","DELETE","OPTIONS"));
